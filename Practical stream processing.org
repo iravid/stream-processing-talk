@@ -1,0 +1,606 @@
+* Practical distributed stream processing with Akka Streams
+
+  - A brief overview of streams and Akka Streams
+
+  - Three complexity levels in Akka Streams' API
+
+  - Limitations of Akka Streams
+  
+  - Production-y stuff: fault tolerance, monitoring
+    and distributing
+
+* What's a stream?
+   
+  - A countable sequence of elements
+
+  - Possibly infinite
+
+  - A monad*
+
+* Lazy vs. strict
+   
+  Possible infinity => laziness:
+
+  #+BEGIN_SRC scala
+  scala> List(1, 2, 3, 4, 5).take(2)
+  res0: List[Int] = List(1, 2) 
+
+  scala> Stream(1, 2, 3, 4, 5).take(3)
+  res2: scala.collection.immutable.Stream[Int] = Stream(1, ?) 
+
+  scala> Stream(1, 2, 3, 4, 5).take(3).force
+  res3: scala.collection.immutable.Stream[Int] = 
+          Stream(1, 2, 3)
+  #+END_SRC
+
+ So the std. lib ~Stream[T]~ is just ... a lazy list.
+* Which is useful, nonetheless:
+
+  #+BEGIN_SRC scala
+  scala> lazy val fibs: Stream[Int] = 0 #:: 1 #:: 
+            fibs.zip(fibs.tail).map(e => e._1 + e._2)
+  fibs: Stream[Int] = <lazy>
+
+  scala> fibs take 5
+  res4: scala.collection.immutable.Stream[Int] = 
+          Stream(0, ?)
+
+  scala> fibs.take(5).force
+  res5: scala.collection.immutable.Stream[Int] = 
+          Stream(0, 1, 1, 2, 3)
+
+  scala> fibs.take(10).force
+  res6: scala.collection.immutable.Stream[Int] = 
+          Stream(0, 1, 1, 2, 3, 5, 8, 13, 21, 34)
+  #+END_SRC
+
+* Microservices <3 Streams!
+
+  - One service emits a stream of item updates
+
+  - Another service reads that stream and indexes the items
+
+* Akka Streams
+
+  - A library for expressing arbitrary _computation graphs_
+   
+  - Explicit separation between description and execution
+
+  - Full range of APIs - from simple combinators to 
+    hand-written actor-like processing stages
+
+* Basic terminology
+
+  - A ~Source[T, M]~ emits elements of type ~T~
+
+  - A ~Flow[I, O, M]~ receives elements of ~I~ 
+    and outputs elements of ~O~
+
+  - A ~Sink[T, M]~ receives elements of type ~T~
+
+  - We'll discuss that ~M~ later on
+
+* Three complexity levels
+
+  - Simple linear graphs with combinators
+
+  - GraphDSL
+  
+  - Custom graph stages
+
+* Simple linear graphs
+
+  Many, many provided combinators; cover 80% of use cases.
+
+  #+BEGIN_SRC scala
+  import akka.stream.scaladsl.Source
+  
+  val fibs: Stream[Int] = ...
+
+  val graph: RunnableGraph[NotUsed] = Source
+    .fromIterator(() => fibs.iterator)
+    .filter(_ % 2 == 0)
+    .map(_ * 2)
+    .grouped(50)
+    .take(50)
+    .to(Sink.foreach(println))
+  #+END_SRC
+
+  At this point - nothing runs. A ~RunnableGraph[M]~ is an
+  execution 'blueprint'.
+
+* Examples - SimpleSource, ElasticsearchWriter
+
+* Materialized values
+  
+  To run the blueprint:
+
+  #+BEGIN_SRC scala
+  val n: NotUsed = graph.run()
+  #+END_SRC
+
+  Note the return type for ~.run()~ - that's ~M~
+
+  When running our graph, we get back the _Materialized Value_
+
+* Materialized values
+
+  Every stage defines a materialized value:
+  
+  #+BEGIN_SRC scala
+  val tick: Source[Int, Cancellable] = 
+    Source.tick(1.second, 5.seconds, 10)
+
+  val head: Sink[Int, Future[Int]] = Sink.head
+  #+END_SRC
+
+  Usually used for control, side-effects or results
+
+* Combining materialized values
+  
+  ~.via~ and ~.to~ have ~Mat~ variants that control the 
+  materialized value combination:
+
+  #+BEGIN_SRC scala
+  val g: RunnableGraph[Cancellable] = 
+    tick.via(Flow[Int].map(_ * 2)).to(head)
+
+
+  val gLeft: RunnableGraph[Cancellable] = 
+    tick.viaMat(Flow[Int].map(_ * 2))(Keep.left)
+        .toMat(head)(Keep.left)
+  #+END_SRC
+* Combining materialized values
+  #+BEGIN_SRC scala
+  val gRight: RunnableGraph[Future[Int]] = 
+    tick.via(Flow[Int].map(_ * 2))
+        .toMat(head)(Keep.right)
+
+  val gBoth: RunnableGraph[(Cancellable, Future[Int])] = 
+    tick.via(Flow[Int].map(_ * 2))
+        .toMat(head)(Keep.both)
+  #+END_SRC
+
+* Example - MaterializedValues
+
+* The execution model
+
+  - All graphs are immutable and freely shareable 
+    (up to mutable state captured in closures)
+  
+  - When ~.run()~, the graphs are materialized - resources
+    are allocated and data starts flowing
+
+  - It's very important to design your streams for
+    multiple materialization! 
+
+* What happens at materialization?
+
+  - Synchronous stages are *fused* - elements passing through
+    are processed directly on the same thread
+
+  - An actor is allocated for each processing island
+
+  - Materialized values are returned to the caller and the 
+    graph is run on the ActorGraphInterpreter
+* GraphDSL
+  - Non-linear graphs are represented using a separate DSL
+
+  - Reach for this whenever fan-in/fan-out/cycles are required
+
+  - First, create a ~Graph[S, M]~:
+
+  #+BEGIN_SRC scala
+  val g: Graph[ClosedShape, NotUsed] =
+    GraphDSL.create() { implicit b =>
+      import GraphDSL.Implicits._
+
+      val src = b.add(Source(List(10, 20, 30)))
+      val flow = b.add(Flow[Int].map(_ * 10))
+      val sink = b.add(Sink.seq[Int])
+
+      src ~> flow ~> sink
+
+      ClosedShape
+    }
+  #+END_SRC
+
+  - ~S~ is the ~Shape~ of the graph.
+
+* GraphDSL
+  Sidenote about ~Graph[S, M]~:
+
+  #+BEGIN_SRC scala
+  Source[T, M] <: Graph[SourceShape[T], M]
+
+  Flow[I, O, M] <: Graph[FlowShape[I, O], M]
+
+  Sink[T, M] <: Graph[SinkShape[T], M]
+
+  SourceShape[T], FlowShape[I, O], ... <: Shape
+  #+END_SRC
+  
+* GraphDSL
+
+  - Next, convert the ~Graph[S, M]~ to a ~RunnableGraph[M]~:
+
+  #+BEGIN_SRC scala
+  val rg: RunnableGraph[NotUsed] =
+    RunnableGraph.fromGraph(rg)
+  #+END_SRC
+
+  - We've lost ~Sink.seq~'s materialized value though.
+    How do we propagate it outside?
+* GraphDSL
+
+  - To reuse materialized values, we need to import them in
+    the call to ~GraphDSL.create()~:
+
+  #+BEGIN_SRC scala
+  val gMat: Graph[ClosedShape, Future[Seq[Int]]] =
+    GraphDSL.create(Sink.seq[Int]) { implicit b => sink =>
+      import GraphDSL.Implicits._
+
+      val src = b.add(Source(List(10, 20, 30)))
+      val flow = b.add(Flow[Int].map(_ * 10))
+
+      src ~> flow ~> sink
+
+      ClosedShape
+    }
+  #+END_SRC
+* Fan-in/Fan-out
+
+  - A common pattern is performing a transformation on data
+    while keeping around a context value
+
+  - For example, deserializing a Kafka message while keeping
+    the original record
+
+  - In terms of streams:
+
+  #+BEGIN_SRC scala
+  kafka ~> duplicate ~> map(rec.body) ~> deserializer ~> zip
+           duplicate               ~>                    zip
+
+    zip ~> out
+  #+END_SRC
+
+* Example - KafkaGraph
+* Custom stages
+
+  #+BEGIN_SRC scala
+  abstract class GraphStage[S <: Shape]
+
+  abstract class GraphStageLogic
+  #+END_SRC
+
+  - Lowest-level API Akka Streams provides
+
+  - Reach for this when you need to maintain state, but can't
+    express with built-in stages
+    (Hint: always try *statefulMapConcat* first)
+
+  - All built-in combinators are written in terms of ~GraphStage~
+    (or earlier iterations of similiar APIs)
+
+  - Custom stages are _harder_ to reason about
+
+* Custom stages
+  
+  First, write the outer class - this is just a factory:
+
+#+BEGIN_SRC scala
+class MyMap(f: Int => String) 
+  extends GraphStage[FlowShape[Int, String]] {
+  val in: Inlet[Int] = Inlet("MyStage.in")
+  val out: Outlet[String] = Outlet("MyStage.out")
+
+  override val shape: FlowShape[Int, String] = 
+    FlowShape(in, out)
+
+  override def createLogic(attrs: Attributes): GraphStageLogic = 
+    ???
+}
+#+END_SRC
+
+  Everything outside the GraphStageLogic _must_ be immutable
+  and freely shareable
+
+* Custom stages: GraphStageLogic
+  
+  Next, write the actual GraphStageLogic:
+
+  #+BEGIN_SRC scala
+  override def createLogic(attrs: Attributes) = 
+    new GraphStageLogic(shape) {
+      var counter: Int = 0
+
+      setHandler(in, new InHandler {
+        // Next slide
+      })
+
+      setHandler(out, new OutHandler {
+        // Next slide
+      })
+    }
+  #+END_SRC
+* Custom stages: InHandlers/OutHandlers
+
+  InHandlers/OutHandlers are similar to actors, 
+  Rx's custom operators, etc.
+
+  #+BEGIN_SRC scala
+  setHandler(out, new OutHandler {
+    override def onPull(): Unit = {
+      pull(in)
+    }
+  })
+
+  setHandler(in, new InHandler {
+    override def onPush(): Unit = {
+      counter += 1
+      push(out, f(grab(in)))
+    }
+  })
+  #+END_SRC
+
+* Custom stages: retaining sanity when writing
+
+  - The best way is to think about the _duty cycle_
+    (term stolen from the Akka team's blog)
+
+    1. Wait for onPull from downstream
+    2. Pull the upstream port
+    3. Wait for onPush
+    4. Grab element, apply function, push downstream
+    5. Pull upstream
+    6. repeat
+  
+  - Very useful state diagrams on the docs
+
+  - Read the docs. Again.
+  
+* Custom stages: more features
+
+  - Custom stages also allow you to:
+    - Clean up allocated resources sanely
+    - Customize error handling
+    - Re-enter the stage asynchronously from outside
+    - Talk to actors (via an ActorRef that represents 
+      the stage)
+    - Use timers
+    - Customize materialized values
+
+  - So basically - enough rope to hang yourself with
+
+  - Try reusing the built-in stages *first*!
+* Testing your implementation
+
+  - Before testing the streams - always prefer to 
+    test the underlying logic
+
+  - Clean code layout will allow you to neatly 
+    decouple the logic itself from the Akka Streams 
+    infrastructure
+
+* Testing your implementation
+
+  - The straightforward way - use ~Source(<mock data>)~,
+    ~Sink.seq~ and assert that everything works
+
+  - Best practice - your streams should be available
+    "unassembled"
+
+  - For asynchronous testing:
+    - TestProbe + Sink.actorRef(WithAck)
+    
+    - TestSource, TestSink
+
+      Provide assertions such as ~expectNextN~, ~expectComplete~,
+      ~expectError~ etc.
+
+* Current limitations
+ - Error handling - rather primitive right now; no hierarchical
+   supervision
+ 
+ - Distribution - streams cannot cross nodes
+
+   Reason is deadlock and livelock risks when messages are lost
+   across nodes
+
+ Let's see how we can work around these.
+
+* Error handling and fault tolerance
+
+  - Basic error handling:
+
+  #+BEGIN_SRC scala
+  val failing = Source(Stream.from(0))
+    .map(el => if (el % 3 == 0) el / 0 else el)
+    .take(100)
+    .toMat(Sink.fold(0)(_ + _))(Keep.right)
+    
+  val decider: Supervision.Decider = {
+    case e =>
+      println(s"Ouch! ${e}")
+      Supervision.Resume // Or Supervision.Restart/Stop
+  } 
+
+  implicit val system = ActorSystem()
+  val settings = ActorMaterializerSettings(system)
+    .withSupervisionStrategy(decider)
+  implicit val mat = ActorMaterializer(settings)
+  
+  failing.run()
+  #+END_SRC
+
+* Error handling and fault tolerance
+  
+  - You can also place a decider on an individual stage:
+
+  #+BEGIN_SRC scala
+  val src = Source(Stream.from(0))
+    .map(...)
+    .withAttributes(
+      ActorAttributes.supervisionStrategy(decider))
+  #+END_SRC
+
+  Stages can override the parent strategy, but errors
+  will not "bubble up"
+
+* Error handling hierarchy
+
+  * Materializer - global decider
+   \
+    \
+     * Stage - decider
+      \
+       \ 
+        * Nested stage - overriding decider
+
+* Examples - SimpleErrorHandling, NoEscalations
+  
+* Alternatives
+
+  - Simplest: run the stream in an actor, send 
+    yourself a message on error and restart
+  
+    Example - ErrorHandlingWithActors
+
+  - Cleaner: implement totality in your functions; 
+    use ~Try[T]~, ~Option[T]~, ~Either[T, U]~ for 
+    risky stages
+
+    Bonus - see ~akka-streams-contrib~ for a stage 
+    that implements retries when using ~Try[T]~
+
+  - Use recover/recoverWithRetries
+
+    Example - RecoverWithRetries
+
+* Error handling in mapAsync
+
+  - The difference here is that we usually 
+    want exponential backoff
+
+  - No built-in mechanism in Akka, but you 
+    can roll your own with ~flatMapConcat~, 
+    ~recoverWithRetries~ and ~delay~
+
+  - Problem: these stages are rather slow - 
+    you pay the materialization costs over and over
+
+  - We've implemented a custom stage called 
+    RetryableMapAsync - will share the implementation
+
+* Measuring stage performance
+
+  - A common use case: measure the execution time of a stage
+
+  - Using Dropwizard Metrics, we can do:
+    
+    #+BEGIN_SRC scala
+    val t: Timer
+    def op[A, B](a: A): B
+    def asyncOp[A, B](a: A): Future[B]
+
+    t.time(op(a))
+
+    t.timeFuture(asyncOp(a))
+    #+END_SRC
+
+  - So one solution would be to implement wrappers 
+    for map and mapAsync
+* Measuring stage performance
+  
+  #+BEGIN_SRC scala
+  def measuredMap[A, B](t: Timer)(f: A => B) = 
+    Flow[A].map(e => t.time(f(e)))
+
+  def measuredMapAsync[A, B](t: Timer)(f: A => Future[B]) = 
+    Flow[A].mapAsync(e => t.timeFuture(f(e)))
+  
+  // Usage:
+  Source(1, 2, 3)
+    .via(measuredMapAsync(timer) { el =>
+      asyncOp(el)
+    })
+    .to(Sink.ignore)
+  #+END_SRC
+* Measuring stage performance
+
+  - Another possible solution is to create a flow 
+    which "wraps" a flow
+
+  - You can do this with ~flatMapConcat~, but again, slow
+
+  - BidiFlow - a stage with two inputs and two outputs:
+  #+BEGIN_SRC 
+   +---------------------------+
+   | Resulting Flow            |
+   |                           |
+   | +------+        +------+  |
+   | |      | ~Out~> |      | ~~> O2
+   | | flow |        | bidi |  |
+   | |      | <~In~  |      | <~~ I2
+   | +------+        +------+  |
+   +---------------------------+
+  #+END_SRC
+
+  We'll also share our MeasuredFlow implementation.
+
+* Measuring stage performance
+
+  - Still, the above solutions don't work for the edges:
+    how would you "wrap" a Source or a Sink?
+
+  - The solution we came up with is to place probe stages:
+    #+BEGIN_SRC scala
+    def measuringStage[T](t: Timer) = 
+      Flow[T].statefulMapConcat { () =>
+        var context: Option[Timer.Context] = None
+
+        el => {
+          context.foreach(_.close())
+          context = Some(t.context())
+          
+          List(el)
+        }
+      }
+
+    val measuredSrc = Source(1, 2, 3).via(measuringStage(t))
+    #+END_SRC
+
+  - This measures time *between* elements - so treat it
+    accordingly
+
+* Distributing streams 
+
+  - Due to message delivery between Akka nodes being at-most-once,
+    streams cannot be naturally 'split' across nodes
+
+  - Alternatives:
+    - Implement self-contained streams; 
+      distribute with Cluster Sharding
+      
+    - Communicate between streams using Kafka (if at-least-once is needed)
+* Distributing streams
+
+  - Alternatives:
+    - Use actors to "split" the streams, and use built-in
+      stages to communicate:
+
+      - Source.actorRef
+      - Source.queue
+      
+      - Sink.actorRef, Sink.actorRefWithAck
+      - Sink.queue
+  
+  - Example - StreamsWithActors
+
+* Questions?
+
+* Thanks!
+
+
