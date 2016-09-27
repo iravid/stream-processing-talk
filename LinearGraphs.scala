@@ -14,7 +14,7 @@ object SimpleSource {
     implicit val system = ActorSystem("streams")
     implicit val mat = ActorMaterializer()
 
-    val src = Source(Stream.from(0))
+    val src: RunnableGraph[NotUsed] = Source(Stream.from(0))
       .filter(_ % 2 == 0)
       .map(_ * 2)
       .grouped(50)

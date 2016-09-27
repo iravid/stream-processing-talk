@@ -75,7 +75,7 @@ object KafkaGraph {
     subscription: Subscription) =
     Consumer.committableSource(settings, subscription)
 
-  def deserializer[T: Reads] = Flow[Array[Byte]]
+  def deserializer[T: Reads]: Flow[Array[Byte], Option[T], NotUsed] = Flow[Array[Byte]]
     .map(Json.parse(_).validate[T].asOpt)
 
   def committer[T] = Flow[(Option[T], KafkaMessage)].mapAsync(1) {

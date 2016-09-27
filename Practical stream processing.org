@@ -1,4 +1,17 @@
-* Practical distributed stream processing with Akka Streams
+* Stream processing with Akka Streams
+
+
+
+                             Hello!
+
+
+               Stream processing with Akka Streams
+
+
+        https://github.com/iravid/stream-processing-talk 
+                             @itrvd
+
+* Stream processing with Akka Streams
 
   - A brief overview of streams and Akka Streams
 
@@ -195,9 +208,9 @@
     GraphDSL.create() { implicit b =>
       import GraphDSL.Implicits._
 
-      val src = b.add(Source(List(10, 20, 30)))
-      val flow = b.add(Flow[Int].map(_ * 10))
-      val sink = b.add(Sink.seq[Int])
+      val src: SourceShape[Int] = b.add(Source(List(10, 20, 30)))
+      val flow: FlowShape[Int, Int] = b.add(Flow[Int].map(_ * 10))
+      val sink: SinkShape[Int] = b.add(Sink.seq[Int])
 
       src ~> flow ~> sink
 
@@ -463,14 +476,14 @@ class MyMap(f: Int => String)
   
 * Alternatives
 
+  - Cleanest: implement totality in your functions; 
+    use ~Try[T]~, ~Option[T]~, ~Either[T, U]~ for 
+    risky stages
+
   - Simplest: run the stream in an actor, send 
     yourself a message on error and restart
   
     Example - ErrorHandlingWithActors
-
-  - Cleaner: implement totality in your functions; 
-    use ~Try[T]~, ~Option[T]~, ~Either[T, U]~ for 
-    risky stages
 
     Bonus - see ~akka-streams-contrib~ for a stage 
     that implements retries when using ~Try[T]~
@@ -493,6 +506,9 @@ class MyMap(f: Int => String)
 
   - We've implemented a custom stage called 
     RetryableMapAsync - will share the implementation
+
+    It has a limitation of running only one
+    future concurrently
 
 * Measuring stage performance
 
@@ -548,7 +564,9 @@ class MyMap(f: Int => String)
    +---------------------------+
   #+END_SRC
 
-  We'll also share our MeasuredFlow implementation.
+  We'll also share our MeasuredFlow implementation; however,
+  note that a cleaner solution is available and shown in the 
+  next slides.
 
 * Measuring stage performance
 
@@ -574,6 +592,12 @@ class MyMap(f: Int => String)
 
   - This measures time *between* elements - so treat it
     accordingly
+
+  - This can be used to wrap flows as well - place a probe before
+    and after each stage
+
+  - akka-streams-contrib contains an implementation of this idea
+    as a custom stage
 
 * Distributing streams 
 
